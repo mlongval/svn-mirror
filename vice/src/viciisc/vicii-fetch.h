@@ -32,6 +32,7 @@
 
 void vicii_fetch_matrix(void);
 uint8_t vicii_fetch_graphics(void);
+void vicii_fetch_kawari_graphics(int phase);
 uint8_t vicii_fetch_idle(void);
 uint8_t vicii_fetch_idle_gfx(void);
 uint8_t vicii_fetch_refresh(void);

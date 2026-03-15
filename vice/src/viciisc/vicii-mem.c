@@ -34,8 +34,10 @@
 
 #include "debug.h"
 #include "types.h"
+#include "mem.h"
 #include "vicii-chip-model.h"
 #include "vicii-colorram.h"
+#include "vicii-color.h"
 #include "vicii-draw-cycle.h"
 #include "vicii-fetch.h"
 #include "vicii-irq.h"
@@ -44,6 +46,87 @@
 #include "vicii.h"
 #include "viciitypes.h"
 
+static char* flash_file_name = NULL;
+static char* fpga_flash_file_name = NULL;
+static int extra_regs_activated = 0;
+static int extra_regs_activation_counter = 0;
+static int flash_reg_activated = 0;
+static int flash_reg_activated_counter = 0;
+static int flash_tick_count = 0;
+static int flash_byte_count = 0;
+static int flash_busy = 0;
+static int flash_op = 0;
+static int flash_verify_error = 0;
+static uint8_t flash_page[4096];
+uint8_t extraRegs[64];
+uint8_t extraMem[65536];
+uint8_t overlayMem[256];
+static unsigned char u_op_1_hi;
+static unsigned char u_op_1_lo;
+static unsigned char u_op_2_hi;
+static unsigned char u_op_2_lo;
+static unsigned char divzero;
+static unsigned short u1;
+static unsigned short u2;
+static signed short s1;
+static signed short s2;
+static unsigned short uquotient;
+static unsigned short uremain;
+static signed short squotient;
+static signed short sremain;
+static unsigned long uresult;
+static signed long sresult;
+static uint8_t pixels_per_byte = 2;
+
+static uint8_t blit_flags;
+static uint8_t blit_done = 1;
+static uint16_t blit_width;
+static uint16_t blit_height;
+static uint16_t blit_src_ptr;
+static uint8_t blit_src_x;
+static uint8_t blit_src_stride;
+static uint16_t blit_dst_ptr;
+static uint8_t blit_dst_x;
+static uint8_t blit_dst_stride;
+static uint8_t blit_state;
+static uint8_t blit_init;
+
+static uint16_t blit_src_cur;
+static uint16_t blit_dst_cur;
+static uint8_t blit_d;
+static uint8_t blit_s;
+static uint8_t blit_o;
+static uint16_t blit_dst_pos;
+static uint16_t blit_src_pos;
+static uint16_t blit_line;
+static uint8_t blit_dst_align;
+static uint8_t blit_src_align;
+static uint8_t blit_src_avail;
+static uint8_t blit_dst_avail;
+static uint8_t blit_out_avail;
+static uint16_t blit_pixels_written;
+static uint16_t blit_tmp_addr;
+
+static uint8_t dma_op = 0;
+static int copy_idx;
+static uint16_t copy_num;
+static uint16_t copy_dest;
+static uint16_t copy_src;
+static uint16_t fill_start;
+static uint16_t fill_num;
+static uint8_t fill_b;
+static uint16_t fill_idx;
+
+static uint16_t flash_bulk_vmem_addr;
+static uint16_t flash_bulk_flash_addr;
+
+static void handle_eeprom_save(int reg, int value);
+static uint8_t read_vram(uint16_t addr) { return extraMem[addr]; }
+static void write_vram(uint16_t addr, uint8_t value) { extraMem[addr] = value; }
+
+#define FLASH_BULK_OP 128
+#define FLASH_BULK_WRITE 1
+#define FLASH_BULK_READ  2
 
 /* Unused bits in VIC-II registers: these are always 1 when read.  */
 static const uint8_t unused_bits_in_registers[0x40] =
@@ -226,7 +309,8 @@ inline static void d018_store(const uint8_t value)
 
 inline static void d019_store(const uint8_t value)
 {
-    vicii.irq_status &= ~((value & 0xf) | 0x80);
+    // Need to include dma irq for kawari
+    vicii.irq_status &= ~((value & (extra_regs_activated ? 0x1f : 0xf)) | 0x80);
     vicii_irq_set_line();
 
     VICII_DEBUG_REGISTER(("IRQ flag register: $%02X", vicii.irq_status));
@@ -234,7 +318,8 @@ inline static void d019_store(const uint8_t value)
 
 inline static void d01a_store(const uint8_t value)
 {
-    vicii.regs[0x1a] = value & 0xf;
+    // Need to include dma irq for kawari
+    vicii.regs[0x1a] = value & (extra_regs_activated ? 0x1f : 0xf);
 
     vicii_irq_set_line();
 
@@ -330,9 +415,124 @@ inline static void sprite_color_store(uint16_t addr, uint8_t value)
     color_reg_store(addr, value);
 }
 
+// Need to cheat a bit here
+extern CLOCK maincpu_clk;
+CLOCK last_auto = 0;
+// Kawawri: Handle auto increment rules for two pointer regs
+static void autoincdec(int fl, int reg)
+{
+    if (maincpu_clk - last_auto < 2)
+       return;
+
+    last_auto = maincpu_clk;
+    if (fl == 1) {
+           extraRegs[reg] = (extraRegs[reg] + 1) & 0xff;
+           if (extraRegs[reg] == 0) {
+                   extraRegs[reg+1] = (extraRegs[reg+1] + 1) & 0xff;
+           }
+    }
+    else if (fl == 2) {
+           extraRegs[reg] = (extraRegs[reg] - 1) & 0xff;
+           if (extraRegs[reg] == 0) {
+                   extraRegs[reg+1] = (extraRegs[reg+1] - 1) & 0xff;
+           }
+    }
+}
+
+
+static void handle_dma(int fl, int value) {
+   if (fl == 3) {
+        if (value == 1) { // block copy low to high
+           dma_op = 1;
+           copy_num = extraRegs[0x36]*256+extraRegs[0x35];
+           copy_idx = 0;
+           copy_dest = extraRegs[0x3a]*256+extraRegs[0x39];
+           copy_src = extraRegs[0x3d]*256+extraRegs[0x3c];
+        } else if (value == 2) { // block copy high to low
+           dma_op = 2;
+           copy_num = extraRegs[0x36]*256+extraRegs[0x35];
+           copy_idx = copy_num - 1;
+           copy_dest = extraRegs[0x3a]*256+extraRegs[0x39];
+           copy_src = extraRegs[0x3d]*256+extraRegs[0x3c];
+        } else if (value == 4) { // fill
+           dma_op = 4;
+           fill_num = extraRegs[0x36]*256+extraRegs[0x35];
+           fill_start = extraRegs[0x3a]*256+extraRegs[0x39];
+           fill_b = extraRegs[0x3c];
+           fill_idx = fill_start;
+        } else if (value == 8) { // dma DRAM to VMEM
+           dma_op = 8;
+           copy_src = extraRegs[0x3d]*256+extraRegs[0x3c];
+           copy_dest = extraRegs[0x3a]*256+extraRegs[0x39];
+           copy_num = extraRegs[0x36]*256+extraRegs[0x35];
+           copy_idx = 0;
+        } else if (value == 16) { // dma VMEM to DRAM
+           dma_op = 16;
+           copy_src = extraRegs[0x3d]*256+extraRegs[0x3c];
+           copy_dest = extraRegs[0x3a]*256+extraRegs[0x39];
+           copy_num = extraRegs[0x36]*256+extraRegs[0x35];
+           copy_idx = 0;
+        } else if (value == 32) { // Set Blitter SRC
+           blit_width = (u_op_1_hi << 8) | u_op_1_lo;
+           blit_width &= 0x3ff;
+           blit_height = (u_op_2_hi << 8) | u_op_2_lo;
+           blit_height &= 0x3ff;
+           blit_src_ptr = ((extraRegs[0x35] << 8) | extraRegs[0x36]) +
+                          (((extraRegs[0x3a] << 8) | extraRegs[0x39]) / pixels_per_byte) +
+                             extraRegs[0x3c] * extraRegs[0x3d];
+           blit_src_x = extraRegs[0x39] & 0x3;
+           blit_src_stride = extraRegs[0x3d];
+        } else if (value == 64) { // Set Blitter DST & Execute
+           blit_flags = u_op_1_hi;
+           blit_dst_ptr = ((extraRegs[0x35] << 8) | extraRegs[0x36]) +
+              (((extraRegs[0x3a] << 8) | extraRegs[0x39]) / pixels_per_byte) +
+                 extraRegs[0x3c] * extraRegs[0x3d];
+           blit_dst_x = extraRegs[0x39] & 0x3;
+           blit_dst_stride = extraRegs[0x3d];
+           blit_done = 0;
+           blit_state = 0;
+           blit_init = 1;
+        }
+   }
+}
+
+static int custom_state = 0;
+static void vicii_custom(uint8_t value) {
+   FILE* fp = NULL;
+   if (custom_state == 0 && value == 128) {
+       custom_state = 1;
+   }
+   else if (custom_state == 1) {
+       custom_state = 0;
+       // LOAD assets.bin file into VMEM 0x8000
+       switch (value) {
+        case 0:
+          fp = fopen(
+              "/shared/Vivado/vicii-kawari/games/him/assets/assets.bin","r");
+          if (fp != NULL) {
+             for (int ii=0;ii<32000;ii++) extraMem[0x8000+ii] = fgetc(fp);
+             fclose(fp);
+          }
+          break;
+        case 1:
+          fp = fopen(
+              "/shared/Vivado/vicii-kawari/games/him/title.bin","r");
+          if (fp != NULL) {
+             for (int ii=0;ii<16384;ii++) extraMem[0x0000+ii] = fgetc(fp);
+             fclose(fp);
+          }
+          break;
+       }
+ 
+      
+   }
+}
+
 /* Store a value in a VIC-II register.  */
 void vicii_store(uint16_t addr, uint8_t value)
 {
+    int fl;
+    uint16_t tmpaddr;
     addr &= 0x3f;
 
     vicii.last_bus_phi2 = value;
@@ -456,23 +656,221 @@ void vicii_store(uint16_t addr, uint8_t value)
             break;
 
         case 0x2f:                /* $D02F: Unused */
+            u_op_1_hi = value;
+            break;
         case 0x30:                /* $D030: Unused */
+            u_op_1_lo = value;
+            break;
         case 0x31:                /* $D031: Unused */
+            u_op_2_hi = value;
+            break;
         case 0x32:                /* $D032: Unused */
+            u_op_2_lo = value;
+            break;
         case 0x33:                /* $D033: Unused */
+            u1 = (u_op_1_hi * 256 + u_op_1_lo);
+            u2 = (u_op_2_hi * 256 + u_op_2_lo);
+            s1 = u1;
+            s2 = u2;
+            divzero = 0;
+            if (value == 0) { // UMULT
+               uresult  = u1 * u2;
+               u_op_1_hi = (uresult >> 24) & 0xff;
+               u_op_1_lo = (uresult >> 16) & 0xff;
+               u_op_2_hi = (uresult >> 8) & 0xff;
+               u_op_2_lo = (uresult) & 0xff;
+            }
+            else if (value == 1) { // UDIV
+               if (u2 == 0) { divzero = 1; return; }
+               uquotient  = u1 / u2;
+               uremain  = u1 % u2;
+               u_op_1_hi = (uremain >> 8) & 0xff;
+               u_op_1_lo = (uremain) & 0xff;
+               u_op_2_hi = (uquotient >> 8) & 0xff;
+               u_op_2_lo = (uquotient) & 0xff;
+            }
+            else if (value == 2) { // SMULT
+               sresult  = s1 * s2;
+               u_op_1_hi = (sresult >> 24) & 0xff;
+               u_op_1_lo = (sresult >> 16) & 0xff;
+               u_op_2_hi = (sresult >> 8) & 0xff;
+               u_op_2_lo = (sresult) & 0xff;
+            }
+            else if (value == 3) { // SDIV
+               if (s2 == 0) { divzero = 1; return; }
+               squotient  = s1 / s2;
+               sremain  = s1 % s2;
+               u_op_1_hi = (sremain >> 8) & 0xff;
+               u_op_1_lo = (sremain) & 0xff;
+               u_op_2_hi = (squotient >> 8) & 0xff;
+               u_op_2_lo = (squotient) & 0xff;
+            }
+            break;
         case 0x34:                /* $D034: Unused */
+            if (!flash_reg_activated) {
+                if (value == 'S') {
+                   flash_reg_activated_counter = 1;
+                } else if (value == 'P' && flash_reg_activated_counter == 1) {
+                   flash_reg_activated_counter++;
+                } else if (value == 'I' && flash_reg_activated_counter == 2) {
+                   flash_reg_activated_counter = 0;
+                   flash_reg_activated = 1;
+                   printf ("SPI activated\n");
+                } else {
+                   flash_reg_activated_counter = 0;
+                }
+            } else {
+               if ((value & 0b10000000) == FLASH_BULK_OP) {
+                   if ((value & 0b11) == FLASH_BULK_READ)
+                   {
+                       // POKE(VIDEO_MEM_FLAGS, 0);
+                       // POKE(VIDEO_MEM_1_IDX,(start_addr >> 16) & 0xff);
+                       // POKE(VIDEO_MEM_1_HI,(start_addr >> 8) & 0xff);
+                       // POKE(VIDEO_MEM_1_LO,(start_addr & 0xff));
+                       // POKE(VIDEO_MEM_2_HI, 0);
+                       // POKE(VIDEO_MEM_2_LO, 0);
+                       flash_bulk_vmem_addr = extraRegs[0x3D]*256+extraRegs[0x3C];
+                       flash_bulk_flash_addr = extraRegs[0x35]*65536+extraRegs[0x3A]*256+extraRegs[0x39];
+                       // 4k page assumed (efinix)
+                       flash_tick_count = 0;      
+                       flash_byte_count = 0;      
+                       flash_busy = 1;      
+                       flash_op = FLASH_BULK_READ;      
+                   } 
+                   else if ((value & 0b11) == FLASH_BULK_WRITE)
+                   {
+                       // POKE(VIDEO_MEM_FLAGS, 0);
+                       // POKE(VIDEO_MEM_1_IDX,(start_addr >> 16) & 0xff);
+                       // POKE(VIDEO_MEM_1_HI,(start_addr >> 8) & 0xff);
+                       // POKE(VIDEO_MEM_1_LO,(start_addr & 0xff));
+                       // POKE(VIDEO_MEM_2_HI, 0);
+                       // POKE(VIDEO_MEM_2_LO, 0);
+                       // mprintf ("READ FLASH,");
+                       // POKE(SPI_REG, FLASH_BULK_OP | FLASH_BULK_READ);
+                       flash_bulk_vmem_addr = extraRegs[0x3D]*256+extraRegs[0x3C];
+                       flash_bulk_flash_addr = extraRegs[0x35]*65536+extraRegs[0x3A]*256+extraRegs[0x39];
+                       // 4k page assumed (efinix)
+                       flash_tick_count = 0;      
+                       flash_byte_count = 0;      
+                       flash_busy = 1;      
+                       flash_op = FLASH_BULK_WRITE;      
+                   }
+               } else {
+                   printf ("WARNING: Direct SPI access not yet emulated!\n");
+               }
+            }
+            break;
         case 0x35:                /* $D035: Unused */
+            if (extra_regs_activated)
+               extraRegs[addr] = value;
+            break;
         case 0x36:                /* $D036: Unused */
+            if (extra_regs_activated)
+               extraRegs[addr] = value;
+            break;
         case 0x37:                /* $D037: Unused */
+            if (extra_regs_activated) {
+               vicii.hires_mode = (value & 0b11100000) >> 5;
+               vicii.hires_enabled = (value & 0b00010000) >> 4;
+               vicii.hires_allow_badlines = (value & 0b00001000) >> 3;
+               vicii.hires_char_pixel_base = (value & 0b111);
+
+               // This is changed with every change to hires_mode
+               pixels_per_byte = vicii.hires_mode == 0b011 ? 4 : 2;
+            }
+            break;
         case 0x38:                /* $D038: Unused */
+            if (extra_regs_activated) {
+               vicii.hires_matrix_base = value & 0b1111;
+               vicii.hires_color_base = (value & 0b11110000) >> 4;
+            }
+            break;
         case 0x39:                /* $D039: Unused */
+            if (extra_regs_activated) {
+               extraRegs[addr] = value;
+            }
+            break;
         case 0x3a:                /* $D03A: Unused */
+            if (extra_regs_activated) {
+               extraRegs[addr] = value;
+            }
+            break;
         case 0x3b:                /* $D03B: Unused */
+            if (extra_regs_activated) {
+              fl = (extraRegs[0x3f] & 0b11);
+
+              // Changed in 1.16 to unconditionally look at dma bits
+              // first. Used to include overlay flag in this condition
+              // but that prevented us from dma copying into overlay regs
+              if ((extraRegs[0x3f] & 0b1111) == 0b1111) {
+                 handle_dma(fl, value);
+              } else {
+                 if (extraRegs[0x3F] & 32) {
+                    overlayMem[extraRegs[0x39]] = value;
+                    handle_color_change(extraRegs[0x39], value);
+                    handle_eeprom_save(extraRegs[0x39], value);
+                    autoincdec(fl, 0x39);
+                 } else {
+                    tmpaddr = extraRegs[0x39]+extraRegs[0x3a]*256+                                                   extraRegs[0x35];
+                    write_vram(tmpaddr, value);
+                    autoincdec(fl, 0x39);
+                 }
+              }
+            }
+            break;
         case 0x3c:                /* $D03C: Unused */
+           if (extra_regs_activated) {
+               extraRegs[addr] = value;
+            }
+            break;
         case 0x3d:                /* $D03D: Unused */
+            if (extra_regs_activated) {
+              extraRegs[addr] = value;
+            }
+            break;
         case 0x3e:                /* $D03E: Unused */
+            if (extra_regs_activated) {
+              if (extraRegs[0x3F] & 32) {
+                 overlayMem[extraRegs[0x3c]] = value;
+                 handle_color_change(extraRegs[0x3c], value);
+                 handle_eeprom_save(extraRegs[0x3c], value);
+              } else {
+                 tmpaddr = extraRegs[0x3c]+
+                    extraRegs[0x3d]*256+extraRegs[0x36];
+                 write_vram(tmpaddr, value);
+              }
+              fl = (extraRegs[0x3f] & 0b1100) >> 2;
+              autoincdec(fl, 0x3c);
+            }
+            break;
         case 0x3f:                /* $D03F: Unused */
-            VICII_DEBUG_REGISTER(("(unused)"));
+            if (extra_regs_activated) {
+                if (value & 128) {
+                  // For emulator, instead of using this bit to disable
+                  // kawari extensions, we use it as an escape function
+                  // to invoke special hooks to make dev easier. When this
+                  // bit is on, we pass to vicii_custom.
+                  vicii_custom(value);
+                } else {
+                  // Only if custom state is 0 (not escaped) do we set the
+                  // value, otherwise, pass through to custom func.
+                  if (custom_state == 0) extraRegs[addr] = value;
+                  else vicii_custom(value);
+                }
+            } else {
+                if (value == 'V') {
+                   extra_regs_activation_counter = 1;
+                } else if (value == 'I' && extra_regs_activation_counter == 1) {
+                   extra_regs_activation_counter++;
+                } else if (value == 'C' && extra_regs_activation_counter == 2) {
+                   extra_regs_activation_counter++;
+                } else if (value == '2' && extra_regs_activation_counter == 3) {
+                   extra_regs_activation_counter = 0;
+                   extra_regs_activated = 1;
+                } else {
+                   extra_regs_activation_counter = 0;
+                }
+            }
             break;
     }
 }
@@ -484,6 +882,24 @@ void vicii_poke(uint16_t addr, uint8_t value)
     if ((addr >= 0x20) && (addr <= 0x2e)) {
         vicii_monitor_colreg_store(addr, value);
         return;
+    } else if (addr == 0x3f) {
+        if (value & 0x80) {
+
+
+                   printf ("RAM dump\n");
+                   int memaddr = 0;
+                   while (memaddr < 65536) {
+                     printf ("%04x: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",memaddr, extraMem[memaddr],extraMem[memaddr+1],extraMem[memaddr+2],extraMem[memaddr+3],extraMem[memaddr+4],extraMem[memaddr+5],extraMem[memaddr+6],extraMem[memaddr+7],extraMem[memaddr+8],extraMem[memaddr+9],extraMem[memaddr+10],extraMem[memaddr+11],extraMem[memaddr+12],extraMem[memaddr+13],extraMem[memaddr+14],extraMem[memaddr+15]);
+                     memaddr+=16;
+                   }
+
+                   printf ("Overlay\n");
+                   memaddr=0;
+                   while (memaddr < 256) {
+                     printf ("%02x: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",memaddr, overlayMem[memaddr],overlayMem[memaddr+1],overlayMem[memaddr+2],overlayMem[memaddr+3],overlayMem[memaddr+4],overlayMem[memaddr+5],overlayMem[memaddr+6],overlayMem[memaddr+7],overlayMem[memaddr+8],overlayMem[memaddr+9],overlayMem[memaddr+10],overlayMem[memaddr+11],overlayMem[memaddr+12],overlayMem[memaddr+13],overlayMem[memaddr+14],overlayMem[memaddr+15]);
+                     memaddr+=16;
+                   }
+        }
     }
     vicii_store(addr, value);
 }
@@ -514,7 +930,7 @@ inline static uint8_t d01112_read(uint16_t addr)
 
 inline static uint8_t d019_read(void)
 {
-    return vicii.irq_status | 0x70;
+    return vicii.irq_status | (extra_regs_activated ? 0x60 : 0x70);
 }
 
 inline static uint8_t d01e_read(void)
@@ -561,6 +977,8 @@ inline static uint8_t d01f_read(void)
 /* Read a value from a VIC-II register.  */
 uint8_t vicii_read(uint16_t addr)
 {
+    int fl;
+    uint16_t tmpaddr;
     uint8_t value;
     addr &= 0x3f;
 
@@ -648,7 +1066,7 @@ uint8_t vicii_read(uint16_t addr)
             break;
 
         case 0x1a:                /* $D01A: IRQ mask register  */
-            value = vicii.regs[addr] | 0xf0;
+            value = vicii.regs[addr] | (extra_regs_activated ? 0xe0 : 0xf0);
             VICII_DEBUG_REGISTER(("Mask register: $%02X", value));
             break;
 
@@ -713,25 +1131,109 @@ uint8_t vicii_read(uint16_t addr)
             value = vicii.regs[addr] | 0xf0;
             break;
 
-        case 0x2f:                /* $D02F: Unused */
-        case 0x30:                /* $D030: Unused */
-        case 0x31:                /* $D031: Unused */
-        case 0x32:                /* $D032: Unused */
-        case 0x33:                /* $D033: Unused */
-        case 0x34:                /* $D034: Unused */
-        case 0x35:                /* $D035: Unused */
-        case 0x36:                /* $D036: Unused */
-        case 0x37:                /* $D037: Unused */
-        case 0x38:                /* $D038: Unused */
-        case 0x39:                /* $D039: Unused */
-        case 0x3a:                /* $D03A: Unused */
-        case 0x3b:                /* $D03B: Unused */
-        case 0x3c:                /* $D03C: Unused */
-        case 0x3d:                /* $D03D: Unused */
-        case 0x3e:                /* $D03E: Unused */
-        case 0x3f:                /* $D03F: Unused */
+        // Kawari: Extra regs PEEK handled here.
+        case 0x2f:
+            value = u_op_1_hi;
+            break;
+        case 0x30:
+            value = u_op_1_lo;
+            break;
+        case 0x31:
+            value = u_op_2_hi;
+            break;
+        case 0x32:
+            value = u_op_2_lo;
+            break;
+        case 0x33:
+            value = divzero;
+            break;
+        case 0x34:
+            value = (flash_busy << 1) | (flash_verify_error << 2);
+            break;
+        case 0x35: // ptr 1 idx
+            if (extra_regs_activated)
+               value = extraRegs[addr];
+            else
+               value = 0xff;
+            break;
+        case 0x36: // ptr 2 idx
+            if (extra_regs_activated)
+               value = extraRegs[addr];
+            else
+               value = 0xff;
+            break;
+        case 0x37: // vmode 1
+            if (extra_regs_activated)
+               value = (vicii.hires_mode << 5) | (vicii.hires_enabled << 4) |
+                    (vicii.hires_allow_badlines << 3) | vicii.hires_char_pixel_base;
+            else
+               value = 0xff;
+            break;
+        case 0x38: // vmode 2
+            if (extra_regs_activated)
+               value = vicii.hires_matrix_base | (vicii.hires_color_base << 4);
+            else
+               value = 0xff;
+            break;
+        case 0x39: // ptr 1 lo
+            if (extra_regs_activated)
+               value = extraRegs[addr];
+            else
+               value = 0xff;
+            break;
+        case 0x3a: // ptr 1 hi
+            if (extra_regs_activated)
+               value = extraRegs[addr];
+            else
+               value = 0xff;
+            break;
+        case 0x3b: // ptr 1 value
+            if (extra_regs_activated) {
+               if (extraRegs[0x3F] & 32) {
+                  value = overlayMem[extraRegs[0x39]];
+               } else {
+                  value = read_vram(extraRegs[0x39]+
+                    extraRegs[0x3a]*256+extraRegs[0x35]);
+               }
+               fl = (extraRegs[0x3f] & 0b11);
+               autoincdec(fl, 0x39);
+            }
+            else
+               value = 0xff;
+            break;
+        case 0x3c: // ptr 2 lo
+            if (extra_regs_activated)
+               value = extraRegs[addr];
+            else
+                value = 0xff;
+            break;
+        case 0x3d: // ptr 2 hi
+            if (extra_regs_activated)
+               value = extraRegs[addr];
+            else
+                value = 0xff;
+            break;
+        case 0x3e: // ptr 2 value
+            if (extra_regs_activated) {
+               if (extraRegs[0x3F] & 32) {
+                  value = overlayMem[extraRegs[0x3c]];
+               } else {
+                  tmpaddr = extraRegs[0x3c]+
+                    extraRegs[0x3d]*256+extraRegs[0x36];
+                  value = read_vram(tmpaddr);
+               }
+               fl = (extraRegs[0x3f] & 0b1100) >> 2;
+               autoincdec(fl, 0x3c);
+            }
+            else
+                value = 0xff;
+            break;
+
         default:
-            value = 0xff;
+            if (extra_regs_activated)
+                value = extraRegs[addr];
+            else
+                value = 0xff;
             break;
     }
 
@@ -741,7 +1243,7 @@ uint8_t vicii_read(uint16_t addr)
 
 inline static uint8_t d019_peek(void)
 {
-    return vicii.irq_status | 0x70;
+    return vicii.irq_status | (extra_regs_activated ? 0x60 : 0x70);
 }
 
 uint8_t vicii_peek(uint16_t addr)
@@ -764,10 +1266,443 @@ uint8_t vicii_peek(uint16_t addr)
             return vicii.sprite_sprite_collisions;
         case 0x1f:            /* $D01F: Sprite-background collision */
             return vicii.sprite_background_collisions;
+        case 0x2f:
+        case 0x30:
+        case 0x31:
+        case 0x32:
+        case 0x33:
+        case 0x34:
+        case 0x35:
+        case 0x36:
+        case 0x37:
+        case 0x38:
+        case 0x39:
+        case 0x3a:
+        case 0x3b:
+        case 0x3c:
+        case 0x3d:
+        case 0x3e:
+        case 0x3f:
+            if (extra_regs_activated) {
+              return extraRegs[addr];
+            } else {
+              return vicii.regs[addr] | unused_bits_in_registers[addr];
+            }
+            break;
         default:
             return vicii.regs[addr] | unused_bits_in_registers[addr];
     }
 }
+
+void do_copy(void) {
+   if (dma_op == 0) return;
+
+   switch (dma_op) {
+     case 1: // low to high
+       if (extraRegs[0x3F] & 32) { // added in 1.16
+          overlayMem[(copy_dest + copy_idx) & 0xff] = read_vram(copy_src + copy_idx);
+          handle_color_change((copy_dest + copy_idx) & 0xff, read_vram(copy_src + copy_idx));
+       } else {
+          write_vram(copy_dest + copy_idx, read_vram(copy_src + copy_idx));
+       }
+       copy_idx++;
+       if (copy_idx == copy_num) {
+           dma_op = 0;
+           // done
+           vicii_irq_dma_set();
+           extraRegs[0x35] = 0;
+           extraRegs[0x36] = 0;
+       }
+       break;
+     case 2: // high to low
+       if (extraRegs[0x3F] & 32) { // added in 1.16
+          overlayMem[(copy_dest + copy_idx) & 0xff] = read_vram(copy_src + copy_idx);
+          handle_color_change((copy_dest + copy_idx) & 0xff,
+              read_vram(copy_src + copy_idx));
+       } else {
+          write_vram(copy_dest+copy_idx, read_vram(copy_src+copy_idx));
+       }
+       copy_idx--;
+       if (copy_idx < 0) {
+           dma_op = 0;
+           // done
+           vicii_irq_dma_set();
+           extraRegs[0x35] = 0;
+           extraRegs[0x36] = 0;
+       }
+       break;
+     default:
+       break;
+   }
+}
+
+void do_flash(void) {
+   // We want to emulate the same amount of cpu time
+   // it would take on the actual device.  This call
+   // represents one tick of the flash state machine
+   //
+   // For write, 42 write + 18 wait + 42 verify per byte
+   // For read, 42 read per byte
+   if (flash_op == FLASH_BULK_WRITE) {
+      // Write from VMEM to FLASH
+      flash_tick_count++;
+      if (flash_tick_count == 42+18+42) {
+          flash_tick_count = 0;
+          // All ticks for the next byte are complete.
+          // Write to the page buf
+          flash_page[flash_byte_count]=read_vram(flash_bulk_vmem_addr);
+          flash_bulk_vmem_addr++;
+          flash_byte_count++;
+          if (flash_byte_count == 4096) { // assume efinix
+             // Persist the page
+             FILE *fp = fopen(fpga_flash_file_name,"r+b");
+             fseek(fp, flash_bulk_flash_addr, SEEK_SET);
+             fwrite(&flash_page[0], 4096, 1, fp);
+             fclose(fp);
+             flash_op = 0;
+             flash_busy = 0;
+             flash_verify_error = 0; // assume always good
+          }
+      }
+   } else if (flash_op == FLASH_BULK_READ) {
+      // Read flash into VMEM
+      flash_tick_count++;
+      if (flash_tick_count == 42) {
+          flash_tick_count = 0;
+          flash_byte_count++;
+          if (flash_byte_count == 4096) { // assume efinix
+             // Read the whole page at once
+             FILE *fp = fopen(fpga_flash_file_name,"r");
+             fseek(fp, flash_bulk_flash_addr, SEEK_SET);
+             fread(&flash_page[0], 4096, 1, fp);
+             fclose(fp);
+    
+             for (int i=0;i<4096;i++) {
+                write_vram(flash_bulk_vmem_addr, flash_page[i]);
+                flash_bulk_vmem_addr++;
+             }
+             flash_op = 0;
+             flash_busy = 0;
+             flash_verify_error = 0; // assume always good
+          }
+      }
+   }
+}
+
+void do_fill(void) {
+   if (dma_op == 0) return;
+
+   switch (dma_op) {
+     case 4:
+       write_vram(fill_idx, fill_b);
+       fill_idx++;
+       if (fill_idx == fill_start + fill_num) {
+          dma_op = 0;
+          // done
+          vicii_irq_dma_set();
+          extraRegs[0x35] = 0;
+          extraRegs[0x36] = 0;
+       }
+       break;
+     default:
+       break;
+   }
+}
+
+void do_dma_xfer(void) {
+   if (dma_op == 0) return;
+
+   unsigned char cia2 = mem_bank_read(3, 56576,0);
+   unsigned int bank = ~cia2 & 0x3;
+   switch (dma_op) {
+     case 8:
+       write_vram(copy_dest, mem_bank_read(bank,copy_src + 16384*bank,0));
+       copy_src++; copy_dest++;
+       copy_idx++;
+       if (copy_idx == copy_num) {
+          dma_op = 0;
+          // done
+          vicii_irq_dma_set();
+          extraRegs[0x35] = 0;
+          extraRegs[0x36] = 0;
+       }
+       break;
+     case 16:
+       mem_bank_write(bank, copy_dest + 16384*bank, read_vram(copy_src), 0);
+       copy_src++; copy_dest++;
+       copy_idx++;
+       if (copy_idx == copy_num) {
+          dma_op = 0;
+          // done
+          vicii_irq_dma_set();
+          extraRegs[0x35] = 0;
+          extraRegs[0x36] = 0;
+       }
+       break;
+     default:
+       break;
+   }
+}
+
+void do_blit(void) {
+    if (!blit_done) {
+       switch (blit_state) {
+           case 0:
+               if (blit_init) {
+                   blit_src_cur = blit_src_ptr;
+                   blit_dst_cur = blit_dst_ptr;
+                   if (pixels_per_byte == 2) {
+                       blit_dst_align = blit_dst_x & 1;
+                       blit_src_align = blit_src_x & 1;
+                   } else {
+                       blit_dst_align = blit_dst_x & 3;
+                       blit_src_align = blit_src_x & 3;
+                   }
+                   blit_src_avail = 0;
+                   blit_dst_avail = 0;
+                   blit_out_avail = 0;
+                   blit_pixels_written = 0;
+                   blit_src_pos = 0;
+                   blit_dst_pos = 0;
+                   blit_line = 0;
+                   blit_init = 0;
+               }
+               break;
+            case 1:
+               if (blit_dst_avail == 0) {
+                   blit_tmp_addr = blit_dst_cur + blit_dst_pos;
+               }
+               break;
+            case 2:
+               break;
+            case 3:
+               if (blit_dst_avail == 0) {
+                    blit_dst_avail = pixels_per_byte;
+                    blit_d = read_vram(blit_tmp_addr);
+               }
+               if (blit_src_avail == 0) {
+                    blit_tmp_addr = blit_src_cur + blit_src_pos;
+               }
+               break;
+            case 4:
+               break;
+            case 5:
+               if (blit_src_avail == 0) {
+                   blit_src_avail = pixels_per_byte;
+                   blit_s = read_vram(blit_tmp_addr);
+                   blit_src_pos = blit_src_pos + 1;
+               }
+               // Handle dst misalignment
+               if (blit_dst_align != 0) {
+                  // If we
+                  if (pixels_per_byte == 2) {
+                      blit_o = (blit_d >> 4) & 0xf;
+                      blit_d = (blit_d & 0xf) << 4;
+                      blit_out_avail = 1;
+                      blit_dst_avail = 1;
+                  } else {
+                      // This case is a litte more...
+                      if (blit_dst_align == 1) {
+                          blit_o = (blit_d >> 6) & 0b11;
+                          blit_d = (blit_d & 0b111111) << 2;
+                      } else if (blit_dst_align == 2) {
+                          blit_o = (blit_d >> 4) & 0b1111;
+                          blit_d = (blit_d & 0b1111) << 4;
+                      } else if (blit_dst_align == 3) {
+                          blit_o = (blit_d >> 2) & 0b111111;
+                          blit_d = (blit_d & 0b11) << 6;
+                      }
+                      blit_out_avail = blit_dst_align;
+                      blit_dst_avail = 4 - blit_dst_align;
+                  }
+                  blit_dst_align = 0;
+               }
+
+               if (blit_src_align != 0) {
+                  // If we
+                  if (pixels_per_byte == 2) {
+                      blit_s = (blit_s & 0xf) << 4;
+                      blit_src_avail = blit_src_avail - 1;
+                  } else {
+                      // NOTE: Had a blitter bug in < 1.16
+                      if (blit_src_align == 1) {
+                         blit_s = (blit_s & 0b111111) << 2;
+                      } else if (blit_src_align == 2) { // was dst in < 1.16
+                         blit_s = (blit_s & 0b1111) << 4;
+                      } else if (blit_src_align == 3) { // was dst in < 1.16
+                         blit_s = (blit_s & 0b11) << 6;
+                      }
+                      blit_src_avail = 4 - blit_src_align;
+                  }
+                  blit_src_align = 0;
+               }
+               break;
+           case 6:
+               if (blit_pixels_written < blit_width) {
+                  if (pixels_per_byte == 2) {
+                     if ((blit_flags & 8) && (blit_s & 0b11110000) == (blit_flags & 0b11110000)) {
+                        blit_o = ((blit_o & 0b1111) << 4) | ((blit_d & 0b11110000) >> 4);
+                     } else {
+                        switch (blit_flags & 0b111) {
+                           case 0:
+                               blit_o = ((blit_o & 0b1111) << 4) | ((blit_s & 0b11110000) >> 4);
+                               break;
+                           case 1:
+                               blit_o = ((blit_o & 0b1111) << 4) | (((blit_s & 0b11110000) >> 4) | ((blit_d & 0b11110000) >> 4));
+                               break;
+                           case 2:
+                               blit_o = ((blit_o & 0b1111) << 4) | (((blit_s & 0b11110000) >> 4) & ((blit_d & 0b11110000) >> 4));
+                               break;
+                           case 3:
+                               blit_o = ((blit_o & 0b1111) << 4) | (((blit_s & 0b11110000) >> 4) ^ ((blit_d & 0b11110000) >> 4));
+                               break;
+                           default:
+                               break;
+                        }
+                     }
+                     blit_d = (blit_d & 0b1111) << 4;
+                     blit_s = (blit_s & 0b1111) << 4;
+                  } else {
+                     if ((blit_flags & 8) && ( ((blit_s & 0b11000000) >>6) == ((blit_flags & 0b110000) >> 4))) {
+                         blit_o = ((blit_o & 0b111111) << 2) | ((blit_d & 0b11) >> 6); // transp
+                     } else {
+                        switch (blit_flags & 0b111) {
+                           case 0:
+                               blit_o = ((blit_o & 0b111111) << 2) | ((blit_s & 0b11000000) >> 6);
+                               break;
+                           case 1:
+                               blit_o = ((blit_o & 0b111111) << 2) | (((blit_s & 0b11000000) >> 6) | ((blit_d & 0b11000000) >> 6));
+                               break;
+                           case 2:
+                               blit_o = ((blit_o & 0b111111) << 2) | (((blit_s & 0b11000000) >> 6) & ((blit_d & 0b11000000) >> 6));
+                               break;
+                           case 3:
+                               blit_o = ((blit_o & 0b111111) << 2) | (((blit_s & 0b11000000) >> 6) ^ ((blit_d & 0b11000000) >> 6));
+                               break;
+                           default:
+                               break;
+                        }
+                     }
+                     blit_d = (blit_d & 0b111111) << 2;
+                     blit_s = (blit_s & 0b111111) << 2;
+                  }
+                  blit_src_avail = blit_src_avail - 1;
+                  blit_pixels_written = blit_pixels_written + 1;
+               } else {
+                  if (pixels_per_byte == 2) {
+                     blit_o = ((blit_o & 0b1111) << 4) | ((blit_d & 0b11110000) >> 4);
+                     // Next line was missing in < 1.16 but did not matter
+                     // since there are only two pixels
+                     blit_d = (blit_d & 0b1111) << 4;
+                  } else {
+                     blit_o = ((blit_o & 0b111111) << 2) | ((blit_d & 0b11000000) >> 6);
+                     // Next line was missing in < 1.16 and caused right edge
+                     // to be destroyed sometimes
+                     blit_d = (blit_d & 0b111111) << 2;
+                  }
+               }
+               blit_dst_avail = blit_dst_avail - 1;
+               blit_out_avail = blit_out_avail + 1;
+               break;
+            case 7:
+               if (blit_out_avail == pixels_per_byte) {
+                   write_vram(blit_dst_cur + blit_dst_pos, blit_o);
+                   blit_out_avail = 0;
+                   blit_dst_pos = blit_dst_pos + 1;
+                   if (blit_pixels_written >= blit_width) {
+                       blit_pixels_written = 0;
+                       blit_dst_pos = 0;
+                       blit_dst_cur = blit_dst_cur + blit_dst_stride;
+                       blit_line = blit_line + 1;
+                       if (pixels_per_byte == 2) {
+                          blit_dst_align = blit_dst_x & 0b1;
+                       } else {
+                          blit_dst_align = blit_dst_x & 0b11;
+                       }
+                       blit_src_pos = 0;
+                       blit_src_cur = blit_src_cur + blit_src_stride;
+                       if (pixels_per_byte == 2) {
+                          blit_src_align = blit_src_x & 0b1;
+                       } else {
+                          blit_src_align = blit_src_x & 0b11;
+                       }
+                       blit_src_avail = 0;
+
+                       if (blit_line == blit_height) {
+                          blit_done = 1;
+                          extraRegs[0x3d] = 0; // signal done
+                          vicii_irq_dma_set();
+                       }
+                   }
+               }
+               break;
+            default:
+               break;
+       }
+       blit_state = blit_state + 1;
+       blit_state = blit_state & 0x7;
+    }
+}
+
+void handle_color_change(uint8_t reg, uint8_t value) {
+
+   if (!kawari_is_composite()) {
+       if (reg >= 0x40 && reg <= 0x7f) {
+          // RGB
+          int colorIndex = (reg - 0x40) / 4;
+          int channel = (reg - 0x40) % 4;
+
+          if (channel < 3) {
+              kawari_set_rgb(colorIndex, channel, value);
+              vicii_color_update_palette(vicii.raster.canvas);
+          }
+       }
+   } else {
+       if (reg >= 0xa0 && reg <= 0xaf) {
+           // Luma
+           kawari_set_luma(reg - 0xa0, value);
+           vicii_color_update_palette(vicii.raster.canvas);
+       } else if (reg >= 0xb0 && reg <= 0xbf) {
+           // Phase
+           kawari_set_angle(reg - 0xb0, value);
+           vicii_color_update_palette(vicii.raster.canvas);
+       } else if (reg >= 0xc0 && reg <= 0xcf) {
+           // Amplitude
+           kawari_set_amplitude(reg - 0xc0, value);
+           vicii_color_update_palette(vicii.raster.canvas);
+       }
+   }
+}
+
+static void handle_eeprom_save(int reg, int value) {
+   if (extraRegs[0x3f] & 64) {
+
+       if (!flash_file_name) return;
+
+       // Save to flash
+       // TODO: Use seek and write a single byte
+       FILE *fp = fopen(flash_file_name,"w");
+       if (fp != NULL) {
+          for (int n=0;n<256;n++) {
+              fprintf(fp,"%c", overlayMem[n]);
+          }
+          fclose(fp);
+       }
+       // Bit 16 goes off to indicate we are done, but we are not emulating
+       // flash delay anyway, so it never went high. TODO: Set high and then
+       // schedule this into the future.
+       extraRegs[0x3f] = extraRegs[0x3f] & 239;
+   }
+}
+
+void set_flash_file_name(char* fname) {
+   flash_file_name = fname;
+}
+
+void set_fpga_flash_file_name(char* fname) {
+   fpga_flash_file_name = fname;
+}
+
 
 void vicii_init_colorram(uint8_t *colorram)
 {

@@ -30,6 +30,10 @@
 
 #include "types.h"
 
+extern unsigned char extraRegs[64];
+extern unsigned char extraMem[65536];
+extern unsigned char overlayMem[256];
+
 void vicii_store(uint16_t addr, uint8_t value);
 void vicii_poke(uint16_t addr, uint8_t value);
 uint8_t vicii_read(uint16_t addr);
@@ -43,5 +47,14 @@ int vicii_extended_regs(void);
 void viciidtv_update_colorram(void);
 
 void vicii_init_colorram(uint8_t *colorram);
+
+void set_flash_file_name(char* fname);
+void set_fpga_flash_file_name(char* fname);
+void handle_color_change(uint8_t reg, uint8_t value);
+void do_copy(void);
+void do_fill(void);
+void do_flash(void);
+void do_dma_xfer(void);
+void do_blit(void);
 
 #endif

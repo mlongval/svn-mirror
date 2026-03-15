@@ -1,0 +1,13 @@
+Makefile.in
+aclocal.m4
+autom4te.cache/
+compile
+configure
+config.h.in
+depcomp
+missing
+ylwrap
+.aclocal.out
+.autoconf.out
+.autoheader.out
+.automake.out
