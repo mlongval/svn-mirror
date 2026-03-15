@@ -19,7 +19,7 @@ See: https://github.com/randyrossi/vicii-kawari
 | Emulator  | Status  | Notes                                      |
 |-----------|---------|--------------------------------------------|
 | x64sc     | Working | All kawari demos confirmed working         |
-| xscpu64   | Broken  | Kawari features not functional in SCPU64   |
+| xscpu64   | Borked  | Kawari features not functional in SCPU64   |
 
 The xscpu64 binary also does not accept a `-kernal` option, so JiffyDOS kernal
 replacement is not available for that target.
