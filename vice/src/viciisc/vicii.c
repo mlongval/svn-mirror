@@ -414,9 +414,9 @@ void vicii_powerup(void)
 
     vicii.hires_allow_badlines = 1;
 
-    FILE *fp = fopen(cfgFlashName,"r");
+    FILE *fp = fopen(cfgFlashName,"rb");
     if (fp == NULL) {
-        fp = fopen(cfgFlashName,"w");
+        fp = fopen(cfgFlashName,"wb");
         if (fp == NULL) {
             printf ("Can't create %s\n", cfgFlashName);
             exit(-1);
@@ -426,7 +426,7 @@ void vicii_powerup(void)
         for (int i=0;i<256;i++) { fputc(defaultFlash[i], fp); }
         fclose(fp);
 
-        fp = fopen(cfgFlashName,"r");
+        fp = fopen(cfgFlashName,"rb");
         if (fp == NULL) {
             printf ("Can't create %s\n", cfgFlashName);
             exit(-1);
@@ -443,9 +443,9 @@ void vicii_powerup(void)
     fclose(fp);
 
     // Now FPGA flash
-    fp = fopen(fpgaFlashName,"r");
+    fp = fopen(fpgaFlashName,"rb");
     if (fp == NULL) {
-        fp = fopen(fpgaFlashName,"w");
+        fp = fopen(fpgaFlashName,"wb");
         if (fp == NULL) {
             printf ("Can't create %s\n", fpgaFlashName);
             exit(-1);
